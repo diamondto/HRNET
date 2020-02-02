@@ -99,6 +99,7 @@ class Bottleneck(nn.Module):
 
 
 class HighResolutionModule(nn.Module):
+    #高分辨率模块
     def __init__(self, num_branches, blocks, num_blocks, num_inchannels,
                  num_channels, fuse_method, multi_scale_output=True):
         super(HighResolutionModule, self).__init__()
@@ -135,25 +136,26 @@ class HighResolutionModule(nn.Module):
                 num_branches, len(num_inchannels))
             logger.error(error_msg)
             raise ValueError(error_msg)
-
+#生成一个分支
     def _make_one_branch(self, branch_index, block, num_blocks, num_channels,
                          stride=1):
         downsample = None
-        if stride != 1 or \
+        if stride != 1 or \#判断是不是降维了，步长为1才能保证维数不变
            self.num_inchannels[branch_index] != num_channels[branch_index] * block.expansion:
+            #判断输入和输出的通道数是否一致，不一致的话，向下执行
             downsample = nn.Sequential(
                 nn.Conv2d(
                     self.num_inchannels[branch_index],
                     num_channels[branch_index] * block.expansion,
                     kernel_size=1, stride=stride, bias=False
-                ),
+                ),#1*1的卷积进行维度的升降，保证通道数相同。
                 nn.BatchNorm2d(
                     num_channels[branch_index] * block.expansion,
                     momentum=BN_MOMENTUM
                 ),
-            )
+            )#典型做法，接BN，这里为什么不用激活呢？
 
-        layers = []
+        layers = []#构建空列表来搭建网络，分支的第一个层的输入输出维度不同，要单独构建，后面循环添加
         layers.append(
             block(
                 self.num_inchannels[branch_index],
@@ -165,6 +167,7 @@ class HighResolutionModule(nn.Module):
         self.num_inchannels[branch_index] = \
             num_channels[branch_index] * block.expansion
         for i in range(1, num_blocks[branch_index]):
+            #循环搭建
             layers.append(
                 block(
                     self.num_inchannels[branch_index],
@@ -183,30 +186,33 @@ class HighResolutionModule(nn.Module):
             )
 
         return nn.ModuleList(branches)
-
+    #融合模块
     def _make_fuse_layers(self):
         if self.num_branches == 1:
             return None
+        #分支数为1 的话不用使用融合，直接返回
 
         num_branches = self.num_branches
         num_inchannels = self.num_inchannels
         fuse_layers = []
+        #双重循环产生多分辨率的结果，通过上采样或者下采样来生成不同分辨率的特征图
         for i in range(num_branches if self.multi_scale_output else 1):
             fuse_layer = []
             for j in range(num_branches):
-                if j > i:
+                if j > i:#此时需要上采样
                     fuse_layer.append(
                         nn.Sequential(
                             nn.Conv2d(
                                 num_inchannels[j],
                                 num_inchannels[i],
                                 1, 1, 0, bias=False
+                                #用1*1的卷积将J分支分辨率上采样到和I分支的分辨率相同。
                             ),
                             nn.BatchNorm2d(num_inchannels[i]),
-                            nn.Upsample(scale_factor=2**(j-i), mode='nearest')
+                            nn.Upsample(scale_factor=2**(j-i), mode='nearest')#上采样，最近邻插值
                         )
                     )
-                elif j == i:
+                elif j == i:#相等，直接添加，不用上下采样
                     fuse_layer.append(None)
                 else:
                     conv3x3s = []
@@ -223,7 +229,7 @@ class HighResolutionModule(nn.Module):
                                     nn.BatchNorm2d(num_outchannels_conv3x3)
                                 )
                             )
-                        else:
+                        else:#此时J<I，要下采样，采用3*3的卷积下采样
                             num_outchannels_conv3x3 = num_inchannels[j]
                             conv3x3s.append(
                                 nn.Sequential(
@@ -240,20 +246,27 @@ class HighResolutionModule(nn.Module):
             fuse_layers.append(nn.ModuleList(fuse_layer))
 
         return nn.ModuleList(fuse_layers)
+    #最后返回的是一个存储了每个分支对应的融合模块的二维数组,比如说两个分支中，
+ #  对于分支１，fuse_layers[0][0]=None,fuse_layers[0][1]=上采样的操作
+
 
     def get_num_inchannels(self):
         return self.num_inchannels
+ #ｘ表示每个分支输入的特征，如果有两个分支，则ｘ就是一个二维数组,
+　　　　　　　#x[0]和x[1]就是两个输入分支的特征
+　　　　　#如果只有一个分支就直接返回，不做任何融合
 
     def forward(self, x):
         if self.num_branches == 1:
-            return [self.branches[0](x[0])]
+            return [self.branches[0](x[0])]  #有多个分支的时候，对每个分支都先用_make_branch函数生成主特征网络，
+　　　　　#　再将特定的网络特征进行融合
 
         for i in range(self.num_branches):
             x[i] = self.branches[i](x[i])
 
-        x_fuse = []
+        x_fuse = []#添加融合模块进行特征融合
 
-        for i in range(len(self.fuse_layers)):
+        for i in range(len(self.fuse_layers)):#对每个分支用_make_fuse_layer生成要进行融合操作的层
             y = x[0] if i == 0 else self.fuse_layers[i][0](x[0])
             for j in range(1, self.num_branches):
                 if i == j:
@@ -263,6 +276,11 @@ class HighResolutionModule(nn.Module):
             x_fuse.append(self.relu(y))
 
         return x_fuse
+  #  进行特征融合，运行到分支一的时候，　self.fuse_layers[i][0](x[0]先生成对于分支一的融合操作，
+　　　　　　　#　for循环得到每个分支对于分支一的采样结果。当i=j，就是分支一本身不进行任何操作直接cat，
+　　　　　　　#　i>j的时候就是分支２对于分支一来说要进行上采样，然后cat得到结果，并cat得到最后的输出。
+        #输出的是最后融合的特征，假如两个分支的时候，输出分支一＋分支二的上采样和分支一的下采样＋分支二，和论文的图片是一样的。
+
 
 
 blocks_dict = {
@@ -270,7 +288,7 @@ blocks_dict = {
     'BOTTLENECK': Bottleneck
 }
 
-
+#关键点预测模块
 class PoseHighResolutionNet(nn.Module):
 
     def __init__(self, cfg, **kwargs):
